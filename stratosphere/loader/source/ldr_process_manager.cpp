@@ -6,9 +6,8 @@
 #include "ldr_npdm.hpp"
 
 Result ProcessManagerService::dispatch(IpcParsedCommand &r, IpcCommand &out_c, u64 cmd_id, u8 *pointer_buffer, size_t pointer_buffer_size) {
-    
     Result rc = 0xF601;
-        
+            
     switch ((ProcessManagerServiceCmd)cmd_id) {
         case Pm_Cmd_CreateProcess:
             rc = WrapIpcCommandImpl<&ProcessManagerService::create_process>(this, r, out_c, pointer_buffer, pointer_buffer_size);
@@ -25,6 +24,7 @@ Result ProcessManagerService::dispatch(IpcParsedCommand &r, IpcCommand &out_c, u
         default:
             break;
     }
+    
     return rc;
 }
 
@@ -37,21 +37,25 @@ std::tuple<Result, MovedHandle> ProcessManagerService::create_process(u64 flags,
     
     fprintf(stderr, "CreateProcess(%016lx, %016lx, %08x);\n", flags, index, reslimit_h.handle);
     
-    rc = Registration::get_registered_tid_sid(index, &tid_sid);
+    rc = Registration::GetRegisteredTidSid(index, &tid_sid);
     if (R_FAILED(rc)) {
-        std::make_tuple(rc, MovedHandle{process_h});
+        return {rc, MovedHandle{process_h}};
     }
     
-    rc = ContentManagement::GetContentPathForTidSid(nca_path, &tid_sid);
+    rc = ContentManagement::ResolveContentPathForTidSid(nca_path, &tid_sid);
     if (R_FAILED(rc)) {
-        std::make_tuple(rc, MovedHandle{process_h});
+        return {rc, MovedHandle{process_h}};
     }
     
     launch_item = LaunchQueue::get_item(tid_sid.title_id);
     
     rc = ProcessCreation::CreateProcess(&process_h, index, nca_path, launch_item, flags, reslimit_h.handle);
     
-    return std::make_tuple(rc, MovedHandle{process_h});
+    if (R_SUCCEEDED(rc)) {
+        ContentManagement::SetCreatedTitle(tid_sid.title_id);
+    }
+    
+    return {rc, MovedHandle{process_h}};
 }
 
 std::tuple<Result> ProcessManagerService::get_program_info(Registration::TidSid tid_sid, OutPointerWithServerSize<ProcessManagerService::ProgramInfo, 0x1> out_program_info) {
@@ -63,40 +67,40 @@ std::tuple<Result> ProcessManagerService::get_program_info(Registration::TidSid 
     rc = populate_program_info_buffer(out_program_info.pointer, &tid_sid);
     
     if (R_FAILED(rc)) {
-        return std::make_tuple(rc);
+        return {rc};
     }
     
-    if (tid_sid.title_id != out_program_info.pointer->title_id_min) {
-        rc = ContentManagement::GetContentPathForTidSid(nca_path, &tid_sid);
+    if (tid_sid.title_id != out_program_info.pointer->title_id) {
+        rc = ContentManagement::ResolveContentPathForTidSid(nca_path, &tid_sid);
         if (R_FAILED(rc)) {
-            return std::make_tuple(rc);
+            return {rc};
         }
         
-        rc = ContentManagement::SetContentPath(nca_path, out_program_info.pointer->title_id_min, tid_sid.storage_id);
+        rc = ContentManagement::RedirectContentPath(nca_path, out_program_info.pointer->title_id, tid_sid.storage_id);
         if (R_FAILED(rc)) {
-            return std::make_tuple(rc);
+            return {rc};
         }
         
-        rc = LaunchQueue::add_copy(tid_sid.title_id, out_program_info.pointer->title_id_min);
+        rc = LaunchQueue::add_copy(tid_sid.title_id, out_program_info.pointer->title_id);
     }
-    
-    return std::make_tuple(rc);
+        
+    return {rc};
 }
 
 std::tuple<Result, u64> ProcessManagerService::register_title(Registration::TidSid tid_sid) {
     u64 out_index = 0;
-    if (Registration::register_tid_sid(&tid_sid, &out_index)) {
-        return std::make_tuple(0, out_index);
+    if (Registration::RegisterTidSid(&tid_sid, &out_index)) {
+        return {0, out_index};
     } else {
-        return std::make_tuple(0xE09, out_index);
+        return {0xE09, out_index};
     }
 }
 
 std::tuple<Result> ProcessManagerService::unregister_title(u64 index) {
-    if (Registration::unregister_index(index)) {
-        return std::make_tuple(0);
+    if (Registration::UnregisterIndex(index)) {
+        return {0};
     } else {
-        return std::make_tuple(0x1009);
+        return {0x1009};
     }
 }
 
@@ -120,7 +124,7 @@ Result ProcessManagerService::populate_program_info_buffer(ProcessManagerService
     out->main_thread_priority = info.header->main_thread_prio;
     out->default_cpu_id = info.header->default_cpuid;
     out->main_thread_stack_size = info.header->main_stack_size;
-    out->title_id_min = info.acid->title_id_range_min;
+    out->title_id = info.aci0->title_id;
     
     out->acid_fac_size = info.acid->fac_size;
     out->aci0_sac_size = info.aci0->sac_size;

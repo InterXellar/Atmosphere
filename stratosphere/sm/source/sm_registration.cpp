@@ -6,11 +6,24 @@
 static Registration::Process g_process_list[REGISTRATION_LIST_MAX_PROCESS] = {0};
 static Registration::Service g_service_list[REGISTRATION_LIST_MAX_SERVICE] = {0};
 
+static u64 g_initial_process_id_low = 0;
+static u64 g_initial_process_id_high = 0;
+static bool g_determined_initial_process_ids = false;
+
+u64 GetServiceNameLength(u64 service) {
+    u64 service_name_len = 0;
+    while (service & 0xFF) {
+        service_name_len++;
+        service >>= 8;
+    }
+    return service_name_len;
+}
+
 /* Utilities. */
 Registration::Process *Registration::GetProcessForPid(u64 pid) {
-    for (unsigned int i = 0; i < REGISTRATION_LIST_MAX_PROCESS; i++) {
-        if (g_process_list[i].pid == pid) {
-            return &g_process_list[i];
+    for (auto &process : g_process_list) {
+        if (process.pid == pid) {
+            return &process;
         }
     }
     return NULL;
@@ -20,10 +33,10 @@ Registration::Process *Registration::GetFreeProcess() {
     return GetProcessForPid(0);
 }
 
-Registration::Service *Registration::GetService(u64 service) {
-    for (unsigned int i = 0; i < REGISTRATION_LIST_MAX_SERVICE; i++) {
-        if (g_service_list[i].service_name == service) {
-            return &g_service_list[i];
+Registration::Service *Registration::GetService(u64 service_name) {
+    for (auto &service : g_service_list) {
+        if (service.service_name == service_name) {
+            return &service;
         }
     }
     return NULL;
@@ -62,7 +75,7 @@ bool Registration::IsValidForSac(u8 *sac, size_t sac_size, u64 service, bool is_
             cur_service &= mask;
             service_for_compare &= mask;
         }
-        if (cur_service == service_for_compare && (!is_host || cur_is_host)) {
+        if (cur_service == service_for_compare && (is_host == cur_is_host)) {
             return true;
         }
         sac += cur_size;
@@ -96,6 +109,30 @@ bool Registration::ValidateSacAgainstRestriction(u8 *r_sac, size_t r_sac_size, u
         remaining -= cur_size;
     }
     return true;
+}
+
+void Registration::CacheInitialProcessIdLimits() {
+    if (g_determined_initial_process_ids) {
+        return;
+    }
+    if (kernelAbove500()) {
+        svcGetSystemInfo(&g_initial_process_id_low, 2, 0, 0);
+        svcGetSystemInfo(&g_initial_process_id_high, 2, 0, 1);
+    } else {
+        g_initial_process_id_low = 0;
+        g_initial_process_id_high = REGISTRATION_INITIAL_PID_MAX;
+    }
+    g_determined_initial_process_ids = true;
+}
+
+bool Registration::IsInitialProcess(u64 pid) {
+    CacheInitialProcessIdLimits();
+    return g_initial_process_id_low <= pid && pid <= g_initial_process_id_high;
+}
+
+u64 Registration::GetInitialProcessId() {
+    CacheInitialProcessIdLimits();
+    return g_initial_process_id_low;
 }
 
 /* Process management. */
@@ -162,17 +199,14 @@ Result Registration::GetServiceForPid(u64 pid, u64 service, Handle *out) {
         return 0xC15;
     }
     
-    u64 service_name_len = 0;
-    while ((service >> (8 * service_name_len)) & 0xFF) {
-        service_name_len++;
-    }
+    u64 service_name_len = GetServiceNameLength(service);
     
     /* If the service has bytes after a null terminator, that's no good. */
-    if ((service >> (8 * service_name_len))) {
+    if (service_name_len != 8 && (service >> (8 * service_name_len))) {
         return 0xC15;
     }
     
-    if (pid >= REGISTRATION_PID_BUILTIN_MAX && service != smEncodeName("dbg:m")) {
+    if (!IsInitialProcess(pid)) {
         Registration::Process *proc = GetProcessForPid(pid);
         if (proc == NULL) {
             return 0x415;
@@ -191,17 +225,14 @@ Result Registration::RegisterServiceForPid(u64 pid, u64 service, u64 max_session
         return 0xC15;
     }
     
-    u64 service_name_len = 0;
-    while ((service >> (8 * service_name_len)) & 0xFF) {
-        service_name_len++;
-    }
+    u64 service_name_len = GetServiceNameLength(service);
     
     /* If the service has bytes after a null terminator, that's no good. */
-    if ((service >> (8 * service_name_len))) {
+    if (service_name_len != 8 && (service >> (8 * service_name_len))) {
         return 0xC15;
     }
     
-    if (pid >= REGISTRATION_PID_BUILTIN_MAX) {
+    if (!IsInitialProcess(pid)) {
         Registration::Process *proc = GetProcessForPid(pid);
         if (proc == NULL) {
             return 0x415;
@@ -240,13 +271,10 @@ Result Registration::RegisterServiceForSelf(u64 service, u64 max_sessions, bool 
         return rc;
     }
     
-    u64 service_name_len = 0;
-    while ((service >> (8 * service_name_len)) & 0xFF) {
-        service_name_len++;
-    }
+    u64 service_name_len = GetServiceNameLength(service);
     
     /* If the service has bytes after a null terminator, that's no good. */
-    if ((service >> (8 * service_name_len))) {
+    if (service_name_len != 8 && (service >> (8 * service_name_len))) {
         return 0xC15;
     }
         
@@ -276,25 +304,11 @@ Result Registration::UnregisterServiceForPid(u64 pid, u64 service) {
         return 0xC15;
     }
     
-    u64 service_name_len = 0;
-    while ((service >> (8 * service_name_len)) & 0xFF) {
-        service_name_len++;
-    }
+    u64 service_name_len = GetServiceNameLength(service);
     
     /* If the service has bytes after a null terminator, that's no good. */
-    if ((service >> (8 * service_name_len))) {
+    if (service_name_len != 8 && (service >> (8 * service_name_len))) {
         return 0xC15;
-    }
-    
-    if (pid >= REGISTRATION_PID_BUILTIN_MAX) {
-        Registration::Process *proc = GetProcessForPid(pid);
-        if (proc == NULL) {
-            return 0x415;
-        }
-        
-        if (!IsValidForSac(proc->sac, proc->sac_size, service, true)) {
-            return 0x1015;
-        }
     }
     
     Registration::Service *target_service = GetService(service);
@@ -302,7 +316,7 @@ Result Registration::UnregisterServiceForPid(u64 pid, u64 service) {
         return 0xE15;
     }
 
-    if (target_service->owner_pid != pid) {
+    if (!IsInitialProcess(pid) && target_service->owner_pid != pid) {
         return 0x1015;
     }
     

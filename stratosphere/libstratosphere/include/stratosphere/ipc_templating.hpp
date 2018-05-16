@@ -6,6 +6,9 @@
 #include "../boost/callable_traits.hpp"
 #include <type_traits>
 
+#pragma GCC diagnostic push 
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+
 /* Represents an A descriptor. */
 template <typename T>
 struct InBuffer {
@@ -184,11 +187,17 @@ T GetValueFromIpcParsedCommand(IpcParsedCommand& r, IpcCommand& out_c, u8 *point
     const size_t old_c_size_offset = cur_c_size_offset;
     const size_t old_pointer_buffer_offset = pointer_buffer_offset;
     if constexpr (is_specialization_of<T, InBuffer>::value) {
-        return T(r.Buffers[a_index], r.BufferSizes[a_index++]);
+        const T& value{r.Buffers[a_index], r.BufferSizes[a_index]};
+        ++a_index;
+        return value;
     } else if constexpr (is_specialization_of<T, OutBuffer>::value) {
-        return T(r.Buffers[b_index], r.BufferSizes[b_index++]);
+        const T& value{r.Buffers[b_index], r.BufferSizes[b_index]};
+        ++b_index;
+        return value;
     } else if constexpr (is_specialization_of<T, InPointer>::value) {
-        return T(r.Statics[x_index], r.StaticSizes[x_index++]);
+        const T& value{r.Statics[x_index], r.StaticSizes[x_index]};
+        ++x_index;
+        return value;
     } else if constexpr (std::is_base_of<OutPointerWithServerSizeBase, T>::value) {
         T t = T(pointer_buffer + old_pointer_buffer_offset);
         ipcAddSendStatic(&out_c, pointer_buffer + old_pointer_buffer_offset, t.num_elements * sizeof(*t.pointer), c_index++);
@@ -202,7 +211,12 @@ T GetValueFromIpcParsedCommand(IpcParsedCommand& r, IpcCommand& out_c, u8 *point
     } else if constexpr (is_ipc_handle<T>::value) {
         return r.Handles[h_index++];
     } else if constexpr (std::is_same<T, PidDescriptor>::value) {
+        cur_rawdata_index += sizeof(u64) / sizeof(u32);
         return PidDescriptor(r.Pid);
+    } else if constexpr (std::is_same<T, bool>::value) {
+        /* Official bools accept non-zero values with low bit unset as false. */
+        cur_rawdata_index += size_in_raw_data<T>::value / sizeof(u32);
+        return ((*(((u32 *)r.Raw + old_rawdata_index))) & 1) == 1;
     } else {
         cur_rawdata_index += size_in_raw_data<T>::value / sizeof(u32);
         return *((T *)((u32 *)r.Raw + old_rawdata_index));
@@ -429,3 +443,27 @@ Result WrapIpcCommandImpl(Class *this_ptr, IpcParsedCommand& r, IpcCommand &out_
     
     return std::apply(Encoder<OutArgs>{out_command}, result);
 }
+
+template<auto IpcCommandImpl>
+Result WrapStaticIpcCommandImpl(IpcParsedCommand& r, IpcCommand &out_command, u8 *pointer_buffer, size_t pointer_buffer_size) {
+    using InArgs = typename boost::callable_traits::args_t<decltype(IpcCommandImpl)>;
+    using OutArgs = typename boost::callable_traits::return_type_t<decltype(IpcCommandImpl)>;
+    
+    static_assert(is_specialization_of<OutArgs, std::tuple>::value, "IpcCommandImpls must return std::tuple<Result, ...>");
+    static_assert(std::is_same_v<std::tuple_element_t<0, OutArgs>, Result>, "IpcCommandImpls must return std::tuple<Result, ...>");
+    
+    ipcInitialize(&out_command);
+
+    Result rc = Validator<InArgs>{r, pointer_buffer_size}();
+        
+    if (R_FAILED(rc)) {
+        return 0xF601;
+    }
+
+    auto args = Decoder<OutArgs, InArgs>::Decode(r, out_command, pointer_buffer);    
+    auto result = std::apply(IpcCommandImpl, args);
+    
+    return std::apply(Encoder<OutArgs>{out_command}, result);
+}
+
+#pragma GCC diagnostic pop

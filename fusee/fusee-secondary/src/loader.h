@@ -2,23 +2,28 @@
 #define FUSEE_LOADER_H
 
 #include "utils.h"
+#include "chainloader.h"
 
-typedef void (*entrypoint_t)(int argc, void **argv); 
+#define LOADER_MAX_PATH_SIZE 255
 
 typedef struct {
-    char path[0x300];
+    char path[0x100];
     const char *key;
     uintptr_t load_address;
+    size_t load_size;
 } load_file_t;
 
 typedef struct {
     const char *bct0;
-    entrypoint_t chainload_entrypoint;
-    load_file_t package2_loadfile;
-    load_file_t exosphere_loadfile;
-    load_file_t tsecfw_loadfile;
-    load_file_t warmboot_loadfile;
-    char custom_splash_path[0x300];
+    uintptr_t chainload_entrypoint;
+    size_t file_id_of_entrypoint;
+    size_t nb_files_to_load;
+    char package2_path[LOADER_MAX_PATH_SIZE+1];
+    char exosphere_path[LOADER_MAX_PATH_SIZE+1];
+    char tsecfw_path[LOADER_MAX_PATH_SIZE+1];
+    char warmboot_path[LOADER_MAX_PATH_SIZE+1];
+    char custom_splash_path[LOADER_MAX_PATH_SIZE+1];
+    char file_paths_to_load[CHAINLOADER_MAX_ENTRIES][LOADER_MAX_PATH_SIZE+1];
 } loader_ctx_t;
 
 #define LOADER_ENTRYPOINT_KEY "entrypoint"
@@ -31,7 +36,7 @@ typedef struct {
 #define LOADER_WARMBOOT_KEY "warmboot"
 
 /* TODO: Should we allow files bigger than 16 MB? */
-#define LOADER_FILESIZE_MAX 0x01000000
+//#define LOADER_FILESIZE_MAX 0x01000000
 
 loader_ctx_t *get_loader_ctx(void);
 

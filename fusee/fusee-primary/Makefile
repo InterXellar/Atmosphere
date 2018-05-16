@@ -26,7 +26,9 @@ CFLAGS = \
 	-fdata-sections \
 	-std=gnu11 \
 	-Werror \
-	-Wall
+	-Wall \
+	-fstrict-volatile-bitfields \
+	-DFUSEE_STAGE1_SRC
 
 LDFLAGS = -specs=linker.specs -g $(ARCH)
 

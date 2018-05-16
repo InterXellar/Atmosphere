@@ -38,7 +38,7 @@ void __libnx_initheap(void) {
 }
 
 void __appInit(void) {
-    /* We must do nothing here, because we are sm. */
+    /* We must do no setup here, because we are sm. */
 }
 
 void __appExit(void) {
@@ -48,7 +48,7 @@ void __appExit(void) {
 int main(int argc, char **argv)
 {
     consoleDebugInit(debugDevice_SVC);
-            
+    
     /* TODO: What's a good timeout value to use here? */
     WaitableManager *server_manager = new WaitableManager(U64_MAX);
         
@@ -59,6 +59,7 @@ int main(int argc, char **argv)
     Handle smm_h;
     if (R_FAILED(Registration::RegisterServiceForSelf(smEncodeName("sm:m"), 1, false, &smm_h))) {
         /* TODO: Panic. */
+        while (1) { }
     }
     
     server_manager->add_waitable(new ExistingPortServer<ManagerService>(smm_h, 1));

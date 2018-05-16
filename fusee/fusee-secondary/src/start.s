@@ -2,16 +2,13 @@
     mov r\@, #0
 .endm
 
-.section .text.start
+.section .text.start, "ax", %progbits
 .arm
 .align 5
 .global _start
+.type   _start, %function
 _start:
-    /* Insert NOPs for convenience (i.e. to use Nintendo's BCTs, for example) */
-    .rept 16
-    nop
-    .endr
-    /* Switch to supervisor mode, mask all interrupts, clear all flags */
+    /* Switch to system mode, mask all interrupts, clear all flags */
     msr cpsr_cxsf, #0xDF
 
     /* Relocate ourselves if necessary */
@@ -21,7 +18,7 @@ _start:
     bne _relocation_loop_end
 
     ldr r4, =__bss_start__
-    sub r4, r4, r2          /* size >= 32, obviously */
+    sub r4, r4, r2          /* size >= 32, obviously, and we've declared 32-byte-alignment */
     _relocation_loop:
         ldmia r3!, {r5-r12}
         stmia r2!, {r5-r12}
@@ -33,24 +30,27 @@ _start:
 
     _relocation_loop_end:
     /* Set the stack pointer */
-    ldr sp, =0x40008000
-    mov fp, #0
-    stmfd sp!, {r0, r1}
+    ldr  sp, =__stack_top__
+    mov  fp, #0
+    bl  __program_init
 
-    /* Clear .bss */
-    ldr r0, =__bss_start__
-    mov r1, #0
-    ldr r2, =__bss_end__
-    sub r2, r2, r0
-    bl  memset
-
-    /* Call global constructors */
-    bl  __libc_init_array
-
-    /* Set r0 to r12 to 0 (because why not?) & call main */
+    /* Set r0 to r12 to 0 (for debugging) & call main */
     .rept 13
     CLEAR_GPR_REG_ITER
     .endr
-    ldmfd sp!, {r0, r1}
-    bl  main
-    b   .
+    ldr r0, =__program_argc
+    ldr r1, =__program_argv
+    ldr lr, =__program_exit
+    ldr r0, [r0]
+    ldr r1, [r1]
+    b   main
+
+/* No need to include this in normal programs: */
+.section .chainloader.text.start, "ax", %progbits
+.arm
+.align 5
+.global relocate_and_chainload
+.type   relocate_and_chainload, %function
+relocate_and_chainload:
+    ldr sp, =__stack_top__
+    b   relocate_and_chainload_main
