@@ -22,9 +22,9 @@ Result InformationService::handle_deferred() {
 }
 
 std::tuple<Result, u64> InformationService::get_title_id(u64 pid) {
-    Registration::AutoProcessListLock auto_lock;
+    auto auto_lock = Registration::GetProcessListUniqueLock();
     
-    Registration::Process *proc = Registration::GetProcess(pid);
+    std::shared_ptr<Registration::Process> proc = Registration::GetProcess(pid);
     if (proc != NULL) {
         return {0x0, proc->tid_sid.title_id};
     } else {

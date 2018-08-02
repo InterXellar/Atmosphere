@@ -1,6 +1,7 @@
 #include <switch.h>
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <cstring>
 #include "sha256.h"
 #include "ldr_nro.hpp"
@@ -35,14 +36,9 @@ Result NroUtils::LoadNro(Registration::Process *target_proc, Handle process_h, u
     unsigned int i;
     Result rc;
     u8 nro_hash[0x20];
-    SHA256_CTX sha_ctx;
+    struct sha256_state sha_ctx;
     /* Ensure there is an available NRO slot. */
-    for (i = 0; i < NRO_INFO_MAX; i++) {
-        if (!target_proc->nro_infos[i].in_use) {
-            break;
-        }
-    }
-    if (i >= NRO_INFO_MAX) {
+    if (std::all_of(target_proc->nro_infos.begin(), target_proc->nro_infos.end(), std::mem_fn(&Registration::NroInfo::in_use))) {
         return 0x6E09;
     }
     for (i = 0; i < 0x200; i++) {
@@ -82,7 +78,8 @@ Result NroUtils::LoadNro(Registration::Process *target_proc, Handle process_h, u
     
     sha256_init(&sha_ctx);
     sha256_update(&sha_ctx, (u8 *)nro, nro->nro_size);
-    sha256_final(&sha_ctx, nro_hash);
+    sha256_finalize(&sha_ctx);
+    sha256_finish(&sha_ctx, nro_hash);
     
     if (!Registration::IsNroHashPresent(target_proc->index, nro_hash)) {
         rc = 0x6C09;

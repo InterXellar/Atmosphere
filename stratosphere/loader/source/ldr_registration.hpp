@@ -1,5 +1,6 @@
 #pragma once
 #include <switch.h>
+#include <array>
 
 #include "ldr_map.hpp"
 
@@ -48,14 +49,14 @@ class Registration {
             u64 process_id;
             u64 title_id;
             Registration::TidSid tid_sid;
-            Registration::NsoInfoHolder nso_infos[NSO_INFO_MAX];
-            Registration::NroInfo nro_infos[NRO_INFO_MAX];
-            MappedCodeMemory nrr_infos[NRR_INFO_MAX];
+            std::array<Registration::NsoInfoHolder, NSO_INFO_MAX> nso_infos;
+            std::array<Registration::NroInfo, NRO_INFO_MAX> nro_infos;
+            std::array<MappedCodeMemory, NRR_INFO_MAX> nrr_infos;
             void *owner_ro_service;
         };
         
         struct List {
-            Registration::Process processes[REGISTRATION_LIST_MAX];
+            std::array<Registration::Process, REGISTRATION_LIST_MAX> processes;
             u64 num_processes;
         };
         
@@ -76,4 +77,7 @@ class Registration {
         static void AddNroToProcess(u64 index, MappedCodeMemory *nro, MappedCodeMemory *bss, u32 text_size, u32 ro_size, u32 rw_size, u8 *build_id);
         static Result RemoveNroInfo(u64 index, Handle process_h, u64 base_address);
         static Result GetNsoInfosForProcessId(NsoInfo *out, u32 max_out, u64 process_id, u32 *num_written);
+        
+        /* Atmosphere MitM Extension. */
+        static void AssociatePidTidForMitM(u64 index);
 };

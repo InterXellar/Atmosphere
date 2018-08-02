@@ -1,7 +1,7 @@
 #include <switch.h>
 #include <cstdio>
 #include <algorithm>
-
+#include <stratosphere.hpp>
 #include "ldr_debug_monitor.hpp"
 #include "ldr_launch_queue.hpp"
 #include "ldr_registration.hpp"
@@ -25,9 +25,9 @@ Result DebugMonitorService::dispatch(IpcParsedCommand &r, IpcCommand &out_c, u64
     return rc;
 }
 
-std::tuple<Result> DebugMonitorService::add_title_to_launch_queue(u64 tid, InPointer<char> args) {
-    fprintf(stderr, "Add to launch queue: %p, %zX\n", args.pointer, args.num_elements);
-    return {LaunchQueue::add(tid, args.pointer, args.num_elements)};
+std::tuple<Result> DebugMonitorService::add_title_to_launch_queue(u64 args_size, u64 tid, InPointer<char> args) {
+    fprintf(stderr, "Add to launch queue: %p, %zX\n", args.pointer, std::min(args_size, args.num_elements));
+    return {LaunchQueue::add(tid, args.pointer, std::min(args_size, args.num_elements))};
 }
 
 std::tuple<Result> DebugMonitorService::clear_launch_queue(u64 dat) {

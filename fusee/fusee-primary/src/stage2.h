@@ -1,7 +1,7 @@
 #ifndef FUSEE_STAGE2_H
 #define FUSEE_STAGE2_H
 
-#include "utils.h"
+#include "sdmmc/sdmmc_core.h"
 
 /* TODO: Is there a more concise way to do this? */
 #define STAGE2_ARGV_PROGRAM_PATH 0
@@ -11,7 +11,7 @@
 #define STAGE2_NAME_KEY "stage2_path"
 #define STAGE2_ADDRESS_KEY "stage2_addr"
 #define STAGE2_ENTRYPOINT_KEY "stage2_entrypoint"
-#define BCTO_MAX_SIZE 0x6000
+#define BCTO_MAX_SIZE 0x5800
 
 typedef struct {
     char path[0x100];
@@ -21,6 +21,7 @@ typedef struct {
 
 typedef struct {
     uint32_t version;
+    bool display_initialized;
     char bct0[BCTO_MAX_SIZE];
 } stage2_args_t;
 

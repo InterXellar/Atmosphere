@@ -1,4 +1,5 @@
 #include <switch.h>
+#include <stratosphere.hpp>
 #include "pm_registration.hpp"
 #include "pm_debug_monitor.hpp"
 
@@ -23,6 +24,9 @@ Result DebugMonitorService::dispatch(IpcParsedCommand &r, IpcCommand &out_c, u64
                 break;
             case Dmnt_Cmd_5X_EnableDebugForApplication:
                 rc = WrapIpcCommandImpl<&DebugMonitorService::enable_debug_for_application>(this, r, out_c, pointer_buffer, pointer_buffer_size);
+                break;
+            case Dmnt_Cmd_5X_AtmosphereGetProcessHandle:
+                rc = WrapIpcCommandImpl<&DebugMonitorService::get_process_handle>(this, r, out_c, pointer_buffer, pointer_buffer_size);
                 break;
             default:
                 break;
@@ -49,6 +53,9 @@ Result DebugMonitorService::dispatch(IpcParsedCommand &r, IpcCommand &out_c, u64
                 break;
             case Dmnt_Cmd_EnableDebugForApplication:
                 rc = WrapIpcCommandImpl<&DebugMonitorService::enable_debug_for_application>(this, r, out_c, pointer_buffer, pointer_buffer_size);
+                break;
+            case Dmnt_Cmd_AtmosphereGetProcessHandle:
+                rc = WrapIpcCommandImpl<&DebugMonitorService::get_process_handle>(this, r, out_c, pointer_buffer, pointer_buffer_size);
                 break;
             default:
                 break;
@@ -86,10 +93,10 @@ std::tuple<Result> DebugMonitorService::launch_debug_process(u64 pid) {
 }
 
 std::tuple<Result, u64> DebugMonitorService::get_title_process_id(u64 tid) {
-    Registration::AutoProcessListLock auto_lock;
+    auto auto_lock = Registration::GetProcessListUniqueLock();
     
-    Registration::Process *proc = Registration::GetProcessByTitleId(tid);
-    if (proc != NULL) {
+    std::shared_ptr<Registration::Process> proc = Registration::GetProcessByTitleId(tid);
+    if (proc != nullptr) {
         return {0, proc->pid};
     } else {
         return {0x20F, 0};
@@ -103,9 +110,9 @@ std::tuple<Result, CopiedHandle> DebugMonitorService::enable_debug_for_tid(u64 t
 }
 
 std::tuple<Result, u64> DebugMonitorService::get_application_process_id() {
-    Registration::AutoProcessListLock auto_lock;
+    auto auto_lock = Registration::GetProcessListUniqueLock();
     
-    Registration::Process *app_proc;
+    std::shared_ptr<Registration::Process> app_proc;
     if (Registration::HasApplicationProcess(&app_proc)) {
         return {0, app_proc->pid};
     }
@@ -116,4 +123,12 @@ std::tuple<Result, CopiedHandle> DebugMonitorService::enable_debug_for_applicati
     Handle h = 0;
     Result rc = Registration::EnableDebugForApplication(&h);
     return {rc, h};
+}
+
+std::tuple<Result, CopiedHandle> DebugMonitorService::get_process_handle(u64 pid) {
+    std::shared_ptr<Registration::Process> proc = Registration::GetProcess(pid);
+    if(proc == NULL) {
+        return {0x20F, 0};
+    }
+    return {0, proc->handle};
 }

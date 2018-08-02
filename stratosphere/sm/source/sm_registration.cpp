@@ -2,9 +2,10 @@
 #include <algorithm>
 #include <stratosphere/servicesession.hpp>
 #include "sm_registration.hpp"
+#include "meta_tools.hpp"
 
-static Registration::Process g_process_list[REGISTRATION_LIST_MAX_PROCESS] = {0};
-static Registration::Service g_service_list[REGISTRATION_LIST_MAX_SERVICE] = {0};
+static std::array<Registration::Process, REGISTRATION_LIST_MAX_PROCESS> g_process_list = {0};
+static std::array<Registration::Service, REGISTRATION_LIST_MAX_SERVICE> g_service_list = {0};
 
 static u64 g_initial_process_id_low = 0;
 static u64 g_initial_process_id_high = 0;
@@ -21,12 +22,11 @@ u64 GetServiceNameLength(u64 service) {
 
 /* Utilities. */
 Registration::Process *Registration::GetProcessForPid(u64 pid) {
-    for (auto &process : g_process_list) {
-        if (process.pid == pid) {
-            return &process;
-        }
+    auto process_it = std::find_if(g_process_list.begin(), g_process_list.end(), member_equals_fn(&Process::pid, pid));
+    if (process_it == g_process_list.end()) {
+        return nullptr;
     }
-    return NULL;
+    return &*process_it;
 }
 
 Registration::Process *Registration::GetFreeProcess() {
@@ -34,12 +34,11 @@ Registration::Process *Registration::GetFreeProcess() {
 }
 
 Registration::Service *Registration::GetService(u64 service_name) {
-    for (auto &service : g_service_list) {
-        if (service.service_name == service_name) {
-            return &service;
-        }
+    auto service_it = std::find_if(g_service_list.begin(), g_service_list.end(), member_equals_fn(&Service::service_name, service_name));
+    if (service_it == g_service_list.end()) {
+        return nullptr;
     }
-    return NULL;
+    return &*service_it;
 }
 
 Registration::Service *Registration::GetFreeService() {
@@ -168,15 +167,10 @@ Result Registration::UnregisterProcess(u64 pid) {
 
 /* Service management. */
 bool Registration::HasService(u64 service) {
-    for (unsigned int i = 0; i < REGISTRATION_LIST_MAX_SERVICE; i++) {
-        if (g_service_list[i].service_name == service) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(g_service_list.begin(), g_service_list.end(), member_equals_fn(&Service::service_name, service));
 }
 
-Result Registration::GetServiceHandle(u64 service, Handle *out) {
+Result Registration::GetServiceHandle(u64 pid, u64 service, Handle *out) {
     Registration::Service *target_service = GetService(service);
     if (target_service == NULL) {
         /* Note: This defers the result until later. */
@@ -184,7 +178,42 @@ Result Registration::GetServiceHandle(u64 service, Handle *out) {
     }
     
     *out = 0;
-    Result rc = svcConnectToPort(out, target_service->port_h);
+    Result rc;
+    if (target_service->mitm_pid == 0 || target_service->mitm_pid == pid) {
+        rc = svcConnectToPort(out, target_service->port_h);
+    } else {
+        IpcCommand c;
+        ipcInitialize(&c);
+        struct {
+            u64 magic;
+            u64 cmd_id;
+            u64 pid;
+        } *info = ((decltype(info))ipcPrepareHeader(&c, sizeof(*info)));
+        info->magic = SFCI_MAGIC;
+        info->cmd_id = 65000;
+        info->pid = pid;
+        rc = ipcDispatch(target_service->mitm_query_h);
+        if (R_SUCCEEDED(rc)) {
+            IpcParsedCommand r;
+            ipcParse(&r);
+            struct {
+                u64 magic;
+                u64 result;
+                u64 should_mitm;
+            } *resp = ((decltype(resp))r.Raw);
+            rc = resp->result;
+            if (R_SUCCEEDED(rc)) {
+                if (resp->should_mitm) {
+                    rc = svcConnectToPort(out, target_service->mitm_port_h);
+                } else {
+                    rc = svcConnectToPort(out, target_service->port_h);
+                }
+            }
+        }
+        if (R_FAILED(rc)) {
+            rc = svcConnectToPort(out, target_service->port_h);
+        }
+    }
     if (R_FAILED(rc)) {
         if ((rc & 0x3FFFFF) == 0xE01) {
             return 0x615;
@@ -217,7 +246,7 @@ Result Registration::GetServiceForPid(u64 pid, u64 service, Handle *out) {
         }
     }
     
-    return GetServiceHandle(service, out);
+    return GetServiceHandle(pid, service, out);
 }
 
 Result Registration::RegisterServiceForPid(u64 pid, u64 service, u64 max_sessions, bool is_light, Handle *out) {
@@ -247,6 +276,12 @@ Result Registration::RegisterServiceForPid(u64 pid, u64 service, u64 max_session
         return 0x815;
     }
     
+#ifdef SM_MINIMUM_SESSION_LIMIT
+    if (max_sessions < SM_MINIMUM_SESSION_LIMIT) {
+        max_sessions = SM_MINIMUM_SESSION_LIMIT;
+    }
+#endif
+
     Registration::Service *free_service = GetFreeService();
     if (free_service == NULL) {
         return 0xA15;
@@ -259,6 +294,8 @@ Result Registration::RegisterServiceForPid(u64 pid, u64 service, u64 max_session
     if (R_SUCCEEDED(rc)) {
         free_service->service_name = service;
         free_service->owner_pid = pid;
+        free_service->max_sessions = max_sessions;
+        free_service->is_light = is_light;
     }
     
     return rc;
@@ -281,6 +318,12 @@ Result Registration::RegisterServiceForSelf(u64 service, u64 max_sessions, bool 
     if (HasService(service)) {
         return 0x815;
     }
+
+#ifdef SM_MINIMUM_SESSION_LIMIT
+    if (max_sessions < SM_MINIMUM_SESSION_LIMIT) {
+        max_sessions = SM_MINIMUM_SESSION_LIMIT;
+    }
+#endif
     
     Registration::Service *free_service = GetFreeService();
     if (free_service == NULL) {
@@ -294,6 +337,8 @@ Result Registration::RegisterServiceForSelf(u64 service, u64 max_sessions, bool 
     if (R_SUCCEEDED(rc)) {
         free_service->service_name = service;
         free_service->owner_pid = pid;
+        free_service->max_sessions = max_sessions;
+        free_service->is_light = is_light;
     }
     
     return rc;
@@ -321,6 +366,103 @@ Result Registration::UnregisterServiceForPid(u64 pid, u64 service) {
     }
     
     svcCloseHandle(target_service->port_h);
+    svcCloseHandle(target_service->mitm_port_h);
+    svcCloseHandle(target_service->mitm_query_h);
     *target_service = (const Registration::Service){0};
     return 0;
+}
+
+
+Result Registration::InstallMitmForPid(u64 pid, u64 service, Handle *out, Handle *query_out) {
+    if (!service) {
+        return 0xC15;
+    }
+    
+    u64 service_name_len = GetServiceNameLength(service);
+    
+    /* If the service has bytes after a null terminator, that's no good. */
+    if (service_name_len != 8 && (service >> (8 * service_name_len))) {
+        return 0xC15;
+    }
+    
+    /* Verify we're allowed to mitm the service. */
+    if (!IsInitialProcess(pid)) {
+        Registration::Process *proc = GetProcessForPid(pid);
+        if (proc == NULL) {
+            return 0x415;
+        }
+        
+        if (!IsValidForSac(proc->sac, proc->sac_size, service, true)) {
+            return 0x1015;
+        }
+    }
+    
+    /* Verify the service exists. */
+    Registration::Service *target_service = GetService(service);
+    if (target_service == NULL) {
+        return 0xE15;
+    }
+    
+    /* Verify the service isn't already being mitm'd. */
+    if (target_service->mitm_pid != 0) {
+        return 0x815;
+    }
+    
+    *out = 0;
+    u64 x = 0;
+    Result rc = svcCreatePort(out, &target_service->mitm_port_h, target_service->max_sessions, target_service->is_light, (char *)&x);
+    
+    if (R_SUCCEEDED(rc) && R_SUCCEEDED((rc = svcCreateSession(query_out, &target_service->mitm_query_h, 0, 0)))) {
+        target_service->mitm_pid = pid;
+    }
+    
+    return rc;
+}
+
+Result Registration::UninstallMitmForPid(u64 pid, u64 service) {
+    if (!service) {
+        return 0xC15;
+    }
+    
+    u64 service_name_len = GetServiceNameLength(service);
+    
+    /* If the service has bytes after a null terminator, that's no good. */
+    if (service_name_len != 8 && (service >> (8 * service_name_len))) {
+        return 0xC15;
+    }
+    
+    Registration::Service *target_service = GetService(service);
+    if (target_service == NULL) {
+        return 0xE15;
+    }
+
+    if (!IsInitialProcess(pid) && target_service->mitm_pid != pid) {
+        return 0x1015;
+    }
+    
+    svcCloseHandle(target_service->mitm_port_h);
+    svcCloseHandle(target_service->mitm_query_h);
+    target_service->mitm_pid = 0;
+    return 0;
+}
+
+Result Registration::AssociatePidTidForMitm(u64 pid, u64 tid) {
+    for (auto &service : g_service_list) {
+        if (service.mitm_pid) {
+            IpcCommand c;
+            ipcInitialize(&c);
+            struct {
+                u64 magic;
+                u64 cmd_id;
+                u64 pid;
+                u64 tid;
+            } *info = ((decltype(info))ipcPrepareHeader(&c, sizeof(*info)));
+            info->magic = SFCI_MAGIC;
+            info->cmd_id = 65001;
+            info->pid = pid;
+            info->tid = tid;
+            ipcDispatch(service.mitm_query_h);
+        }
+    }
+    return 0x0;
 }

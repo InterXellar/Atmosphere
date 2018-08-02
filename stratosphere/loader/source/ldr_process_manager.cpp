@@ -1,4 +1,5 @@
 #include <switch.h>
+#include <stratosphere.hpp>
 #include "ldr_process_manager.hpp"
 #include "ldr_registration.hpp"
 #include "ldr_launch_queue.hpp"
@@ -7,7 +8,7 @@
 
 Result ProcessManagerService::dispatch(IpcParsedCommand &r, IpcCommand &out_c, u64 cmd_id, u8 *pointer_buffer, size_t pointer_buffer_size) {
     Result rc = 0xF601;
-            
+                
     switch ((ProcessManagerServiceCmd)cmd_id) {
         case Pm_Cmd_CreateProcess:
             rc = WrapIpcCommandImpl<&ProcessManagerService::create_process>(this, r, out_c, pointer_buffer, pointer_buffer_size);
@@ -24,7 +25,6 @@ Result ProcessManagerService::dispatch(IpcParsedCommand &r, IpcCommand &out_c, u
         default:
             break;
     }
-    
     return rc;
 }
 
@@ -42,10 +42,13 @@ std::tuple<Result, MovedHandle> ProcessManagerService::create_process(u64 flags,
         return {rc, MovedHandle{process_h}};
     }
     
-    rc = ContentManagement::ResolveContentPathForTidSid(nca_path, &tid_sid);
-    if (R_FAILED(rc)) {
-        return {rc, MovedHandle{process_h}};
+    if (tid_sid.storage_id != FsStorageId_None) {
+        rc = ContentManagement::ResolveContentPathForTidSid(nca_path, &tid_sid);
+        if (R_FAILED(rc)) {
+            return {rc, MovedHandle{process_h}};
+        }
     }
+
     
     launch_item = LaunchQueue::get_item(tid_sid.title_id);
     
@@ -70,7 +73,7 @@ std::tuple<Result> ProcessManagerService::get_program_info(Registration::TidSid 
         return {rc};
     }
     
-    if (tid_sid.title_id != out_program_info.pointer->title_id) {
+    if (tid_sid.storage_id != FsStorageId_None && tid_sid.title_id != out_program_info.pointer->title_id) {
         rc = ContentManagement::ResolveContentPathForTidSid(nca_path, &tid_sid);
         if (R_FAILED(rc)) {
             return {rc};
@@ -108,18 +111,28 @@ std::tuple<Result> ProcessManagerService::unregister_title(u64 index) {
 Result ProcessManagerService::populate_program_info_buffer(ProcessManagerService::ProgramInfo *out, Registration::TidSid *tid_sid) {
     NpdmUtils::NpdmInfo info;
     Result rc;
+    bool mounted_code = false;
     
-    rc = ContentManagement::MountCodeForTidSid(tid_sid);  
-    if (R_FAILED(rc)) {
-        return rc;
+    if (tid_sid->storage_id != FsStorageId_None) {
+        rc = ContentManagement::MountCodeForTidSid(tid_sid);  
+        if (R_FAILED(rc)) {
+            return rc;
+        }
+        mounted_code = true;
+    } else if (R_SUCCEEDED(ContentManagement::MountCodeNspOnSd(tid_sid->title_id))) {
+        mounted_code = true;
     }
     
     rc = NpdmUtils::LoadNpdm(tid_sid->title_id, &info);
+    
+    if (mounted_code) {
+        ContentManagement::UnmountCode();
+    }
+    
     if (R_FAILED(rc)) {
         return rc;
     }
-    
-    ContentManagement::UnmountCode();
+
     
     out->main_thread_priority = info.header->main_thread_prio;
     out->default_cpu_id = info.header->default_cpuid;

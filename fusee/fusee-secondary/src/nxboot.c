@@ -14,6 +14,14 @@
 #include "exocfg.h"
 #include "display/video_fb.h"
 #include "lib/ini.h"
+#include "hwinit/t210.h"
+
+#define u8 uint8_t
+#define u32 uint32_t
+#include "exosphere_bin.h"
+#undef u8
+#undef u32
+
 #include "hwinit/cluster.h"
 
 static int exosphere_ini_handler(void *user, const char *section, const char *name, const char *value) {
@@ -30,20 +38,18 @@ static int exosphere_ini_handler(void *user, const char *section, const char *na
     return 1;
 }
 
-void nxboot_configure_exosphere(void) {
+static void nxboot_configure_exosphere(void) {
     exosphere_config_t exo_cfg = {0};
 
     exo_cfg.magic = MAGIC_EXOSPHERE_BOOTCONFIG;
     exo_cfg.target_firmware = EXOSPHERE_TARGET_FIRMWARE_MAX;
 
     if (ini_parse_string(get_loader_ctx()->bct0, exosphere_ini_handler, &exo_cfg) < 0) {
-        printf("Error: Failed to parse BCT.ini!\n");
-        generic_panic();
+        fatal_error("Failed to parse BCT.ini!\n");
     }
 
     if (exo_cfg.target_firmware < EXOSPHERE_TARGET_FIRMWARE_MIN || exo_cfg.target_firmware > EXOSPHERE_TARGET_FIRMWARE_MAX) {
-        printf("Error: Invalid Exosphere target firmware!\n");
-        generic_panic();
+        fatal_error("Invalid Exosphere target firmware!\n");
     }
 
     *(MAILBOX_EXOSPHERE_CONFIGURATION) = exo_cfg;
@@ -53,7 +59,9 @@ void nxboot_configure_exosphere(void) {
 static nx_keyblob_t __attribute__((aligned(16))) g_keyblobs[32];
 void nxboot_main(void) {
     loader_ctx_t *loader_ctx = get_loader_ctx();
-    package2_header_t *package2 = NULL;
+    /* void *bootconfig; */
+    package2_header_t *package2;
+    size_t package2_size;
     void *tsec_fw;
     size_t tsec_fw_size;
     void *warmboot_fw;
@@ -62,13 +70,55 @@ void nxboot_main(void) {
     size_t package1loader_size ;
     package1_header_t *package1;
     size_t package1_size;
-    uint32_t revision = EXOSPHERE_TARGET_FIRMWARE_MAX;
-    FILE *boot0 = fopen("boot0:/", "rb");
+    uint32_t available_revision;
+    FILE *boot0, *pk2file;
     void *exosphere_memaddr;
 
-    if (boot0 == NULL || package1_read_and_parse_boot0(&package1loader, &package1loader_size, g_keyblobs, &revision, boot0) == -1) {
-        printf("Error: Couldn't parse boot0: %s!\n", strerror(errno));
-        generic_panic();
+    /* TODO: How should we deal with bootconfig? */
+    package2 = memalign(4096, PACKAGE2_SIZE_MAX);
+    if (package2 == NULL) {
+        fatal_error("nxboot: out of memory!\n");
+    }
+
+    /* Read Package2 from a file, otherwise from its partition(s). */
+    if (loader_ctx->package2_path[0] != '\0') {
+        pk2file = fopen(loader_ctx->package2_path, "rb");
+        if (pk2file == NULL) {
+            fatal_error("Failed to open Package2 from %s: %s!\n", loader_ctx->package2_path, strerror(errno));
+        }
+    } else {
+        pk2file = fopen("bcpkg21:/", "rb");
+        if (pk2file == NULL || fseek(pk2file, 0x4000, SEEK_SET) != 0) {
+            printf("Error: Failed to open Package2 from eMMC: %s!\n", strerror(errno));
+            fclose(pk2file);
+            generic_panic();
+        }
+    }
+
+    setvbuf(pk2file, NULL, _IONBF, 0); /* Workaround. */
+    if (fread(package2, sizeof(package2_header_t), 1, pk2file) < 1) {
+        fatal_error("Failed to read Package2!\n");
+    }
+
+    package2_size = package2_meta_get_size(&package2->metadata);
+    if (package2_size > PACKAGE2_SIZE_MAX || package2_size <= sizeof(package2_header_t)) {
+        fatal_error("Package2 is too big or too small!\n");
+    }
+
+    if (fread(package2->data, package2_size - sizeof(package2_header_t), 1, pk2file) < 1) {
+        fatal_error("Failed to read Package2!\n");
+    }
+
+    fclose(pk2file);
+    printf("Read package2!\n");
+
+    /* Setup boot configuration for Exosphère. */
+    nxboot_configure_exosphere();
+
+    printf("Reading boot0...\n");
+    boot0 = fopen("boot0:/", "rb");
+    if (boot0 == NULL || package1_read_and_parse_boot0(&package1loader, &package1loader_size, g_keyblobs, &available_revision, boot0) == -1) {
+        fatal_error("Couldn't parse boot0: %s!\n", strerror(errno));
     }
     fclose(boot0);
 
@@ -76,27 +126,22 @@ void nxboot_main(void) {
     if (loader_ctx->tsecfw_path[0] != '\0') {
         tsec_fw_size = get_file_size(loader_ctx->tsecfw_path);
         if (tsec_fw_size != 0 && tsec_fw_size != 0xF00) {
-            printf("Error: TSEC firmware from %s has a wrong size!\n", loader_ctx->tsecfw_path);
-            generic_panic();
+            fatal_error("TSEC firmware from %s has a wrong size!\n", loader_ctx->tsecfw_path);
         } else if (tsec_fw_size == 0) {
-            printf("Error: Could not read the TSEC firmware from %s!\n", loader_ctx->tsecfw_path);
-            generic_panic();
+            fatal_error("Could not read the TSEC firmware from %s!\n", loader_ctx->tsecfw_path);
         }
 
         tsec_fw = memalign(0x100, tsec_fw_size);
         if (tsec_fw == NULL) {
-            printf("Error: nxboot_main: out of memory!\n");
-            generic_panic();
+            fatal_error("nxboot_main: out of memory!\n");
         }
         if (read_from_file(tsec_fw, tsec_fw_size, loader_ctx->tsecfw_path) != tsec_fw_size) {
-            printf("Error: Could not read the TSEC firmware from %s!\n", loader_ctx->tsecfw_path);
-            generic_panic();
+            fatal_error("Could not read the TSEC firmware from %s!\n", loader_ctx->tsecfw_path);
         }
     } else {
         tsec_fw_size = package1_get_tsec_fw(&tsec_fw, package1loader, package1loader_size);
         if (tsec_fw_size == 0) {
-            printf("Error: Failed to read the TSEC firmware from Package1loader!\n");
-            generic_panic();
+            fatal_error("Failed to read the TSEC firmware from Package1loader!\n");
         }
     }
 
@@ -104,31 +149,24 @@ void nxboot_main(void) {
 
     /* TODO: Initialize Boot Reason. */
 
-    /* Setup boot configuration for Exosphere. */
-    nxboot_configure_exosphere();
-
     /* Derive keydata. */
-    if (derive_nx_keydata(MAILBOX_EXOSPHERE_CONFIGURATION->target_firmware, g_keyblobs, revision, tsec_fw, tsec_fw_size) != 0) {
-        printf("Error: Key derivation failed!\n");
-        generic_panic();
+    if (derive_nx_keydata(MAILBOX_EXOSPHERE_CONFIGURATION->target_firmware, g_keyblobs, available_revision, tsec_fw, tsec_fw_size) != 0) {
+        fatal_error("Key derivation failed!\n");
     }
 
     /* Read the warmboot firmware from a file, otherwise from PK1. */
     if (loader_ctx->warmboot_path[0] != '\0') {
         warmboot_fw_size = get_file_size(loader_ctx->warmboot_path);
         if (warmboot_fw_size == 0) {
-            printf("Error: Could not read the warmboot firmware from %s!\n", loader_ctx->warmboot_path);
-            generic_panic();
+            fatal_error("Could not read the warmboot firmware from %s!\n", loader_ctx->warmboot_path);
         }
 
         warmboot_fw = malloc(warmboot_fw_size);
         if (warmboot_fw == NULL) {
-            printf("Error: nxboot_main: out of memory!\n");
-            generic_panic();
+            fatal_error("nxboot_main: out of memory!\n");
         }
         if (read_from_file(warmboot_fw, warmboot_fw_size, loader_ctx->warmboot_path) != warmboot_fw_size) {
-            printf("Error: Could not read the warmboot firmware from %s!\n", loader_ctx->warmboot_path);
-            generic_panic();
+            fatal_error("Could not read the warmboot firmware from %s!\n", loader_ctx->warmboot_path);
         }
     } else {
         uint8_t ctr[16];
@@ -142,50 +180,16 @@ void nxboot_main(void) {
         }
 
         if (warmboot_fw_size == 0) {
-            printf("Error: Could not read the warmboot firmware from Package1!\n");
-            generic_panic();
+            fatal_error("Could not read the warmboot firmware from Package1!\n");
         }
     }
 
-    /* TODO: How should we deal with bootconfig? */
-    package2 = memalign(4096, PACKAGE2_SIZE_MAX);
-    if (package2 == NULL) {
-        printf("Error: nxboot: out of memory!\n");
-        generic_panic();
-    }
-
-    /* Read Package2 from a file, otherwise from its partition(s). */
-    if (loader_ctx->package2_path[0] != '\0') {
-        size_t package2_size = get_file_size(loader_ctx->package2_path);
-        if (package2_size == 0) {
-            printf("Error: Could not read Package2 from %s!\n", loader_ctx->package2_path);
-            generic_panic();
-        } else if (package2_size > PACKAGE2_SIZE_MAX) {
-            printf("Error: Package2 from %s is too big!\n", loader_ctx->package2_path);
-            generic_panic();
-        }
-
-        if (read_from_file(package2, package2_size, loader_ctx->package2_path) != package2_size) {
-            printf("Error: Could not read Package2 from %s!\n", loader_ctx->package2_path);
-            generic_panic();
-        }
-    } else {
-        FILE *bcpkg21 = fopen("bcpkg21:/", "rb");
-        if (bcpkg21 == NULL)  {
-            printf("Error: Failed to read Package2 from NAND!\n");
-            generic_panic();
-        }
-        if (fseek(bcpkg21, 0x4000, SEEK_SET) != 0 || fread(package2, 1, PACKAGE2_SIZE_MAX, bcpkg21) < sizeof(package2_header_t)) {
-            printf("Error: Failed to read Package2 from NAND!\n");
-            generic_panic();
-        }
-        fclose(bcpkg21);
-    }
-
+    printf("Rebuilding package2...\n");
     /* Patch package2, adding Thermosphère + custom KIPs. */
     package2_rebuild_and_copy(package2, MAILBOX_EXOSPHERE_CONFIGURATION->target_firmware);
 
-    /* Copy Exophère to a good location (or read it directly to it.) */
+    printf(u8"Reading Exosphère...\n");
+    /* Copy Exosphère to a good location (or read it directly to it.) */
     if (MAILBOX_EXOSPHERE_CONFIGURATION->target_firmware <= EXOSPHERE_TARGET_FIRMWARE_400) {
         exosphere_memaddr = (void *)0x40020000;
     } else {
@@ -195,21 +199,16 @@ void nxboot_main(void) {
     if (loader_ctx->exosphere_path[0] != '\0') {
         size_t exosphere_size = get_file_size(loader_ctx->exosphere_path);
         if (exosphere_size == 0) {
-            printf(u8"Error: Could not read Exosphère from %s!\n", loader_ctx->exosphere_path);
-            generic_panic();
+            fatal_error(u8"Error: Could not read Exosphère from %s!\n", loader_ctx->exosphere_path);
         } else if (exosphere_size > 0x10000) {
             /* The maximum is actually a bit less than that. */
-            printf(u8"Error: Exosphère from %s is too big!\n", loader_ctx->exosphere_path);
-            generic_panic();
+            fatal_error(u8"Error: Exosphère from %s is too big!\n", loader_ctx->exosphere_path);
         }
 
         if (read_from_file(exosphere_memaddr, exosphere_size, loader_ctx->exosphere_path) != exosphere_size) {
-            printf(u8"Error: Could not read Exosphère from %s!\n", loader_ctx->exosphere_path);
-            generic_panic();
+            fatal_error(u8"Error: Could not read Exosphère from %s!\n", loader_ctx->exosphere_path);
         }
     } else {
-        extern const uint8_t exosphere_bin[];
-        extern const uint32_t exosphere_bin_size;
         memcpy(exosphere_memaddr, exosphere_bin, exosphere_bin_size);
     }
 
@@ -220,10 +219,12 @@ void nxboot_main(void) {
     } else {
         MAILBOX_NX_BOOTLOADER_SETUP_STATE = NX_BOOTLOADER_STATE_LOADED_PACKAGE2_4X;
     }
+    printf("Powering on the CCPLEX...\n");
     cluster_enable_cpu0((uint64_t)(uintptr_t)exosphere_memaddr, 1);
     while (MAILBOX_NX_BOOTLOADER_IS_SECMON_AWAKE == 0) {
         /* Wait for Exosphere to wake up. */
     }
+    printf(u8"Exopshère is responding!\n");
     if (MAILBOX_EXOSPHERE_CONFIGURATION->target_firmware < EXOSPHERE_TARGET_FIRMWARE_400) {
         MAILBOX_NX_BOOTLOADER_SETUP_STATE = NX_BOOTLOADER_STATE_FINISHED;
     } else {
@@ -243,5 +244,8 @@ void nxboot_main(void) {
     /* Display splash screen. */
     display_splash_screen_bmp(loader_ctx->custom_splash_path);
 
-    /* TODO: Halt ourselves. */
+    //Halt ourselves in waitevent state.
+    while (1) {
+        FLOW_CTLR(0x4) = 0x50000000;
+    }
 }

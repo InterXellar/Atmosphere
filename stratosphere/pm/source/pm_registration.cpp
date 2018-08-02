@@ -22,34 +22,24 @@ static SystemEvent *g_process_event = NULL;
 static SystemEvent *g_debug_title_event = NULL;
 static SystemEvent *g_debug_application_event = NULL;
 
-Registration::AutoProcessListLock::AutoProcessListLock() {
-    g_process_list.Lock();
-    this->has_lock = true;
+std::unique_lock<HosRecursiveMutex> Registration::GetProcessListUniqueLock() {
+    return g_process_list.get_unique_lock();
 }
 
-Registration::AutoProcessListLock::~AutoProcessListLock() {
-    if (this->has_lock) {
-        this->Unlock();
-    }
-}
-
-void Registration::AutoProcessListLock::Unlock() {
-    if (this->has_lock) {
-        g_process_list.Unlock();
-    }
-    this->has_lock = false;
+void Registration::SetProcessListManager(WaitableManager *m) {
+    g_process_list.set_manager(m);
 }
 
 void Registration::InitializeSystemResources() {
-    g_process_event = new SystemEvent(&IEvent::PanicCallback);
-    g_debug_title_event = new SystemEvent(&IEvent::PanicCallback);
-    g_debug_application_event = new SystemEvent(&IEvent::PanicCallback);
-    g_process_launch_start_event = new SystemEvent(&Registration::ProcessLaunchStartCallback);
+    g_process_event = new SystemEvent(NULL, &IEvent::PanicCallback);
+    g_debug_title_event = new SystemEvent(NULL, &IEvent::PanicCallback);
+    g_debug_application_event = new SystemEvent(NULL, &IEvent::PanicCallback);
+    g_process_launch_start_event = new SystemEvent(NULL, &Registration::ProcessLaunchStartCallback);
     
     ResourceLimitUtils::InitializeLimits();
 }
 
-Result Registration::ProcessLaunchStartCallback(Handle *handles, size_t num_handles, u64 timeout) {
+Result Registration::ProcessLaunchStartCallback(void *arg, Handle *handles, size_t num_handles, u64 timeout) {
     svcClearEvent(handles[0]);
     Registration::HandleProcessLaunch();
     return 0;
@@ -59,10 +49,6 @@ IWaitable *Registration::GetProcessLaunchStartEvent() {
     return g_process_launch_start_event;
 }
 
-IWaitable *Registration::GetProcessList() {
-    return &g_process_list;
-}
-
 void Registration::HandleProcessLaunch() {
     LoaderProgramInfo program_info = {0};
     Result rc;
@@ -70,9 +56,9 @@ void Registration::HandleProcessLaunch() {
     u64 *out_pid = g_process_launch_state.out_pid;
     Process new_process = {0};
     new_process.tid_sid = g_process_launch_state.tid_sid;
-    u8 *ac_buf = new u8[4 * sizeof(LoaderProgramInfo)];
-    std::fill(ac_buf, ac_buf + 4 * sizeof(LoaderProgramInfo), 0xCC);
-    u8 *acid_sac = ac_buf, *aci0_sac = acid_sac + sizeof(LoaderProgramInfo), *fac = aci0_sac + sizeof(LoaderProgramInfo), *fah = fac + sizeof(LoaderProgramInfo);
+    auto ac_buf = std::vector<u8>(4 * sizeof(LoaderProgramInfo));
+    std::fill(ac_buf.begin(), ac_buf.end(), 0xCC);
+    u8 *acid_sac = ac_buf.data(), *aci0_sac = acid_sac + sizeof(LoaderProgramInfo), *fac = aci0_sac + sizeof(LoaderProgramInfo), *fah = fac + sizeof(LoaderProgramInfo);
             
     /* Check that this is a real program. */
     if (R_FAILED((rc = ldrPmGetProgramInfo(new_process.tid_sid.title_id, new_process.tid_sid.storage_id, &program_info)))) {
@@ -119,27 +105,27 @@ void Registration::HandleProcessLaunch() {
         
     /* Setup process flags. */
     if (program_info.application_type & 1) {
-        new_process.flags |= 0x40;
+        new_process.flags |= PROCESSFLAGS_APPLICATION;
     }
     if (kernelAbove200() && LAUNCHFLAGS_NOTIYDEBUGSPECIAL(launch_flags) && (program_info.application_type & 4)) { 
-        new_process.flags |= 0x80;
+        new_process.flags |= PROCESSFLAGS_NOTIFYDEBUGSPECIAL;
     }
     if (LAUNCHFLAGS_NOTIFYWHENEXITED(launch_flags)) {
-        new_process.flags |= 1;
+        new_process.flags |= PROCESSFLAGS_NOTIFYWHENEXITED;
     }
     if (LAUNCHFLAGS_NOTIFYDEBUGEVENTS(launch_flags) && (!kernelAbove200() || (program_info.application_type & 4))) {
-        new_process.flags |= 0x8;
+        new_process.flags |= PROCESSFLAGS_NOTIFYDEBUGEVENTS;
     }
     
     /* Add process to the list. */
-    Registration::AddProcessToList(&new_process);
+    Registration::AddProcessToList(std::make_shared<Registration::Process>(new_process));
     
     /* Signal, if relevant. */
     if (new_process.tid_sid.title_id == g_debug_on_launch_tid.load()) {
         g_debug_title_event->signal_event();
         g_debug_on_launch_tid = 0;
         rc = 0;
-    } else if ((new_process.flags & 0x40) && g_debug_next_application.load()) {
+    } else if ((new_process.flags & PROCESSFLAGS_APPLICATION) && g_debug_next_application.load()) {
         g_debug_application_event->signal_event();
         g_debug_next_application = false;
         rc = 0;
@@ -166,6 +152,7 @@ SM_REGISTRATION_FAILED:
 FS_REGISTRATION_FAILED:
     if (R_FAILED(rc)) {
         svcCloseHandle(new_process.handle);
+        new_process.handle = 0;
     }
     
 PROCESS_CREATION_FAILED:
@@ -178,17 +165,16 @@ HANDLE_PROCESS_LAUNCH_END:
     if (R_SUCCEEDED(rc)) {
         *out_pid = new_process.pid;
     }
-    delete ac_buf;
     g_sema_finish_launch.Signal();
 }
 
 
 Result Registration::LaunchDebugProcess(u64 pid) {
-    AutoProcessListLock auto_lock;
+    auto auto_lock = GetProcessListUniqueLock();
     LoaderProgramInfo program_info = {0};
     Result rc;
     
-    Process *proc = GetProcess(pid);
+    std::shared_ptr<Registration::Process> proc = GetProcess(pid);
     if (proc == NULL) {
         return 0x20F;
     }
@@ -210,9 +196,8 @@ Result Registration::LaunchDebugProcess(u64 pid) {
 }
 
 Result Registration::LaunchProcess(u64 title_id, FsStorageId storage_id, u64 launch_flags, u64 *out_pid) {
-    Result rc;
     /* Only allow one mutex to exist. */
-    g_process_launch_mutex.Lock();
+    std::scoped_lock lk{g_process_launch_mutex};
     g_process_launch_state.tid_sid.title_id = title_id;
     g_process_launch_state.tid_sid.storage_id = storage_id;
     g_process_launch_state.launch_flags = launch_flags;
@@ -222,17 +207,14 @@ Result Registration::LaunchProcess(u64 title_id, FsStorageId storage_id, u64 lau
     g_process_launch_start_event->signal_event();
     g_sema_finish_launch.Wait();
     
-    rc = g_process_launch_state.result;
-    
-    g_process_launch_mutex.Unlock();
-    return rc;
+    return g_process_launch_state.result;
 }
 
 Result Registration::LaunchProcessByTidSid(TidSid tid_sid, u64 launch_flags, u64 *out_pid) {
     return LaunchProcess(tid_sid.title_id, tid_sid.storage_id, launch_flags, out_pid);
 };
 
-void Registration::HandleSignaledProcess(Process *process) {
+Result Registration::HandleSignaledProcess(std::shared_ptr<Registration::Process> process) {
     u64 tmp;
      
     /* Reset the signal. */
@@ -244,7 +226,7 @@ void Registration::HandleSignaledProcess(Process *process) {
     process->state = (ProcessState)tmp;
     
     if (old_state == ProcessState_Crashed && process->state != ProcessState_Crashed) {
-        process->flags &= ~0x4;
+        process->flags &= ~PROCESSFLAGS_CRASH_DEBUG;
     }
     switch (process->state) {
         case ProcessState_Created:
@@ -252,47 +234,47 @@ void Registration::HandleSignaledProcess(Process *process) {
         case ProcessState_Exiting:
             break;
         case ProcessState_DebugDetached:
-            if (process->flags & 8) {
-                process->flags &= ~0x30;
-                process->flags |= 0x10;
+            if (process->flags & PROCESSFLAGS_NOTIFYDEBUGEVENTS) {
+                process->flags &= ~(PROCESSFLAGS_DEBUGEVENTPENDING | PROCESSFLAGS_DEBUGSUSPENDED);
+                process->flags |= PROCESSFLAGS_DEBUGEVENTPENDING;
                 g_process_event->signal_event();
             }
-            if (kernelAbove200() && process->flags & 0x80) {
-                process->flags &= ~0x180;
-                process->flags |= 0x100;
+            if (kernelAbove200() && process->flags & PROCESSFLAGS_NOTIFYDEBUGSPECIAL) {
+                process->flags &= ~(PROCESSFLAGS_NOTIFYDEBUGSPECIAL | PROCESSFLAGS_DEBUGDETACHED);
+                process->flags |= PROCESSFLAGS_DEBUGDETACHED;
             }
             break;
         case ProcessState_Crashed:
-            process->flags |= 6;
+            process->flags |= (PROCESSFLAGS_CRASHED | PROCESSFLAGS_CRASH_DEBUG);
             g_process_event->signal_event();
             break;
         case ProcessState_Running:
-            if (process->flags & 8) {
-                process->flags &= ~0x30;
-                process->flags |= 0x10;
+            if (process->flags & PROCESSFLAGS_NOTIFYDEBUGEVENTS) {
+                process->flags &= ~(PROCESSFLAGS_DEBUGEVENTPENDING | PROCESSFLAGS_DEBUGSUSPENDED);
+                process->flags |= PROCESSFLAGS_DEBUGEVENTPENDING;
                 g_process_event->signal_event();
             }
             break;
         case ProcessState_Exited:
-            if (process->flags & 1 && !kernelAbove500()) {
+            if (process->flags & PROCESSFLAGS_NOTIFYWHENEXITED && !kernelAbove500()) {
                 g_process_event->signal_event();
             } else {
                 FinalizeExitedProcess(process);
             }
-            //Reboot();
-            break;
+            return 0xF601;
         case ProcessState_DebugSuspended:
-            if (process->flags & 8) {
-                process->flags |= 0x30;
+            if (process->flags & PROCESSFLAGS_NOTIFYDEBUGEVENTS) {
+                process->flags |= (PROCESSFLAGS_DEBUGEVENTPENDING | PROCESSFLAGS_DEBUGSUSPENDED);
                 g_process_event->signal_event();
             }
             break;
     }
+    return 0;
 }
 
-void Registration::FinalizeExitedProcess(Process *process) {
-    AutoProcessListLock auto_lock;
-    bool signal_debug_process_5x = kernelAbove500() && process->flags & 1;
+void Registration::FinalizeExitedProcess(std::shared_ptr<Registration::Process> process) {
+    auto auto_lock = GetProcessListUniqueLock();
+    bool signal_debug_process_5x = kernelAbove500() && process->flags & PROCESSFLAGS_NOTIFYWHENEXITED;
     /* Unregister with FS. */
     if (R_FAILED(fsprUnregisterProgram(process->pid))) {
         /* TODO: Panic. */
@@ -308,50 +290,49 @@ void Registration::FinalizeExitedProcess(Process *process) {
     
     /* Close the process's handle. */
     svcCloseHandle(process->handle);
+    process->handle = 0;
     
     /* Insert into dead process list, if relevant. */
     if (signal_debug_process_5x) {
-        g_dead_process_list.Lock();
-        g_dead_process_list.process_waiters.push_back(new ProcessWaiter(process));
-        g_dead_process_list.Unlock();
+        auto lk = g_dead_process_list.get_unique_lock();
+        g_dead_process_list.processes.push_back(process);
     }
     
     /* Remove NOTE: This probably frees process. */
     RemoveProcessFromList(process->pid);
 
-    auto_lock.Unlock();
+    auto_lock.unlock();
     if (signal_debug_process_5x) {
         g_process_event->signal_event();
     }
 }
 
-void Registration::AddProcessToList(Process *process) {
-    AutoProcessListLock auto_lock;
-    g_process_list.process_waiters.push_back(new ProcessWaiter(process));
+void Registration::AddProcessToList(std::shared_ptr<Registration::Process> process) {
+    auto auto_lock = GetProcessListUniqueLock();
+    g_process_list.processes.push_back(process);
+    g_process_list.get_manager()->add_waitable(new ProcessWaiter(process));
 }
 
 void Registration::RemoveProcessFromList(u64 pid) {
-    AutoProcessListLock auto_lock;
+    auto auto_lock = GetProcessListUniqueLock();
     
     /* Remove process from list. */
-    for (unsigned int i = 0; i < g_process_list.process_waiters.size(); i++) {
-        ProcessWaiter *pw = g_process_list.process_waiters[i];
-        Registration::Process *process = pw->get_process();
-        if (process->pid == pid) {      
-            g_process_list.process_waiters.erase(g_process_list.process_waiters.begin() + i);
+    for (unsigned int i = 0; i < g_process_list.processes.size(); i++) {
+        std::shared_ptr<Registration::Process> process = g_process_list.processes[i];
+        if (process->pid == pid) {
+            g_process_list.processes.erase(g_process_list.processes.begin() + i);
             svcCloseHandle(process->handle);
-            delete pw;
+            process->handle = 0;
             break;
         }
     }
 }
 
 void Registration::SetProcessState(u64 pid, ProcessState new_state) {
-    AutoProcessListLock auto_lock;
+    auto auto_lock = GetProcessListUniqueLock();
     
     /* Set process state. */
-    for (auto &pw : g_process_list.process_waiters) {
-        Registration::Process *process = pw->get_process();
+    for (auto &process : g_process_list.processes) {
         if (process->pid == pid) {      
             process->state = new_state;
             break;
@@ -359,13 +340,12 @@ void Registration::SetProcessState(u64 pid, ProcessState new_state) {
     }
 }
 
-bool Registration::HasApplicationProcess(Process **out) {
-    AutoProcessListLock auto_lock;
+bool Registration::HasApplicationProcess(std::shared_ptr<Registration::Process> *out) {
+    auto auto_lock = GetProcessListUniqueLock();
     
-    for (auto &pw : g_process_list.process_waiters) {
-        Registration::Process *process = pw->get_process();
-        if (process->flags & 0x40) {
-            if (out != NULL) {
+    for (auto &process : g_process_list.processes) {
+        if (process->flags & PROCESSFLAGS_APPLICATION) {
+            if (out != nullptr) {
                 *out = process;
             }
             return true;
@@ -375,42 +355,39 @@ bool Registration::HasApplicationProcess(Process **out) {
     return false;
 }
 
-Registration::Process *Registration::GetProcess(u64 pid) {
-    AutoProcessListLock auto_lock;
+std::shared_ptr<Registration::Process> Registration::GetProcess(u64 pid) {
+    auto auto_lock = GetProcessListUniqueLock();
     
-    for (auto &pw : g_process_list.process_waiters) {
-        Process *p = pw->get_process();
-        if (p->pid == pid) {
-            return p;
+    for (auto &process : g_process_list.processes) {
+        if (process->pid == pid) {
+            return process;
         }
     }
     
-    return NULL;
+    return nullptr;
 }
 
-Registration::Process *Registration::GetProcessByTitleId(u64 tid) {
-    AutoProcessListLock auto_lock;
+std::shared_ptr<Registration::Process> Registration::GetProcessByTitleId(u64 tid) {
+    auto auto_lock = GetProcessListUniqueLock();
     
-    for (auto &pw : g_process_list.process_waiters) {
-        Process *p = pw->get_process();
-        if (p->tid_sid.title_id == tid) {
-            return p;
+    for (auto &process : g_process_list.processes) {
+        if (process->tid_sid.title_id == tid) {
+            return process;
         }
     }
     
-    return NULL;
+    return nullptr;
 }
 
 
 Result Registration::GetDebugProcessIds(u64 *out_pids, u32 max_out, u32 *num_out) {
-    AutoProcessListLock auto_lock;
+    auto auto_lock = GetProcessListUniqueLock();
     u32 num = 0;
     
 
-    for (auto &pw : g_process_list.process_waiters) {
-        Process *p = pw->get_process();
-        if (p->flags & 4 && num < max_out) {
-            out_pids[num++] = p->pid;
+    for (auto &process : g_process_list.processes) {
+        if (process->flags & PROCESSFLAGS_CRASH_DEBUG && num < max_out) {
+            out_pids[num++] = process->pid;
         }
     }
     
@@ -423,48 +400,49 @@ Handle Registration::GetProcessEventHandle() {
 }
 
 void Registration::GetProcessEventType(u64 *out_pid, u64 *out_type) {
-    AutoProcessListLock auto_lock;
+    auto auto_lock = GetProcessListUniqueLock();
     
-    for (auto &pw : g_process_list.process_waiters) {
-        Process *p = pw->get_process();
-        if (kernelAbove200() && p->state >= ProcessState_DebugDetached && p->flags & 0x100) {
-            p->flags &= ~0x100;
+    for (auto &p : g_process_list.processes) {
+        if (kernelAbove200() && p->state >= ProcessState_DebugDetached && p->flags & PROCESSFLAGS_DEBUGDETACHED) {
+            p->flags &= ~PROCESSFLAGS_DEBUGDETACHED;
             *out_pid = p->pid;
-            *out_type = kernelAbove500() ? 2 : 5;
+            *out_type = kernelAbove500() ? PROCESSEVENTTYPE_500_DEBUGDETACHED : PROCESSEVENTTYPE_DEBUGDETACHED;
             return;
         }
-        if (p->flags & 0x10) {
+        if (p->flags & PROCESSFLAGS_DEBUGEVENTPENDING) {
             u64 old_flags = p->flags;
-            p->flags &= ~0x10;
+            p->flags &= ~PROCESSFLAGS_DEBUGEVENTPENDING;
             *out_pid = p->pid;
-            *out_type = kernelAbove500() ? (((old_flags >> 5) & 1) | 4) : (((old_flags >> 5) & 1) + 3);
+            *out_type = kernelAbove500() ?
+                ((old_flags & PROCESSFLAGS_DEBUGSUSPENDED) ?
+                    PROCESSEVENTTYPE_500_SUSPENDED :
+                    PROCESSEVENTTYPE_500_RUNNING) :
+                ((old_flags & PROCESSFLAGS_DEBUGSUSPENDED) ?
+                    PROCESSEVENTTYPE_SUSPENDED :
+                    PROCESSEVENTTYPE_RUNNING);
             return;
         }
-        if (p->flags & 2) {
+        if (p->flags & PROCESSFLAGS_CRASHED) {
             *out_pid = p->pid;
-            *out_type = kernelAbove500() ? 3 : 1;
+            *out_type = kernelAbove500() ? PROCESSEVENTTYPE_500_CRASH : PROCESSEVENTTYPE_CRASH;
             return;
         }
-        if (!kernelAbove500() && p->flags & 1 && p->state == ProcessState_Exited) {
+        if (!kernelAbove500() && p->flags & PROCESSFLAGS_NOTIFYWHENEXITED && p->state == ProcessState_Exited) {
             *out_pid = p->pid;
-            *out_type = 2;
+            *out_type = PROCESSEVENTTYPE_EXIT;
             return;
         }
     }
     if (kernelAbove500()) {
-        auto_lock.Unlock();
-        g_dead_process_list.Lock();
-        if (g_dead_process_list.process_waiters.size()) {
-            ProcessWaiter *pw = g_dead_process_list.process_waiters[0];
-            Registration::Process *process = pw->get_process();
-            g_dead_process_list.process_waiters.erase(g_dead_process_list.process_waiters.begin());
+        auto_lock.unlock();
+        auto dead_process_list_lock = g_dead_process_list.get_unique_lock();
+        if (g_dead_process_list.processes.size()) {
+            std::shared_ptr<Registration::Process> process = g_dead_process_list.processes[0];
+            g_dead_process_list.processes.erase(g_dead_process_list.processes.begin());
             *out_pid = process->pid;
-            *out_type = 1;
-            delete pw;
-            g_dead_process_list.Unlock();
+            *out_type = PROCESSEVENTTYPE_500_EXIT;
             return;
         }
-        g_dead_process_list.Unlock();
     }
     *out_pid = 0;
     *out_type = 0;

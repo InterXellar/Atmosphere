@@ -25,7 +25,7 @@ typedef struct rawdev_device_t {
     device_partition_t devpart;
     char name[32+1];
     char root_path[34+1];
-    bool setup;
+    bool setup, registered;
 } rawdev_device_t;
 
 typedef struct rawdev_file_t {
@@ -49,6 +49,16 @@ static devoptab_t g_rawdev_devoptab = {
   .deviceData   = NULL,
 };
 
+static rawdev_device_t *rawdev_find_device(const char *name) {
+    for (size_t i = 0; i < RAWDEV_MAX_DEVICES; i++) {
+        if (g_rawdev_devices[i].setup && strcmp(g_rawdev_devices[i].name, name) == 0) {
+            return &g_rawdev_devices[i];
+        }
+    }
+
+    return NULL;
+}
+
 int rawdev_mount_device(const char *name, const device_partition_t *devpart, bool initialize_immediately) {
     rawdev_device_t *device = NULL;
     char drname[40];
@@ -64,7 +74,7 @@ int rawdev_mount_device(const char *name, const device_partition_t *devpart, boo
         errno = ENAMETOOLONG;
         return -1;
     }
-    if (FindDevice(drname) != -1) {
+    if (rawdev_find_device(name) != NULL) {
         errno = EEXIST; /* Device already exists */
         return -1;
     }
@@ -105,32 +115,73 @@ int rawdev_mount_device(const char *name, const device_partition_t *devpart, boo
         return -1;
     }
 
+    device->setup = true;
+    device->registered = false;
+
+    return 0;
+}
+
+int rawdev_register_device(const char *name) {
+    rawdev_device_t *device = rawdev_find_device(name);
+    if (device == NULL) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    if (device->registered) {
+        /* Do nothing if the device is already registered. */
+        return 0;
+    }
+
     if (AddDevice(&device->devoptab) == -1) {
         errno = ENOMEM;
         return -1;
     } else {
-        device->setup = true;
+        device->registered = true;
+        return 0;
+    }
+}
+
+int rawdev_unregister_device(const char *name) {
+    rawdev_device_t *device = rawdev_find_device(name);
+    char drname[40];
+
+    if (device == NULL) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    if (!device->registered) {
+        /* Do nothing if the device is not registered. */
+        return 0;
+    }
+
+    strcpy(drname, name);
+    strcat(drname, ":");
+
+    if (RemoveDevice(drname) == -1) {
+        errno = ENOENT;
+        return -1;
+    } else {
+        device->registered = false;
         return 0;
     }
 }
 
 int rawdev_unmount_device(const char *name) {
-    char drname[40];
-    int devid;
-    rawdev_device_t *device;
+    int rc;
+    rawdev_device_t *device = rawdev_find_device(name);
 
-    strcpy(drname, name);
-    strcat(drname, ":");
-
-    devid = FindDevice(drname);
-
-    if (devid == -1) {
+    if (device == NULL) {
         errno = ENOENT;
         return -1;
     }
 
-    device = (rawdev_device_t *)(GetDeviceOpTab(name)->deviceData);
-    RemoveDevice(drname);
+    rc = rawdev_unregister_device(name);
+    if (rc == -1) {
+        return -1;
+    }
+
     free(device->tmp_sector);
     device->devpart.finalizer(&device->devpart);
     memset(device, 0, sizeof(rawdev_device_t));
@@ -140,8 +191,10 @@ int rawdev_unmount_device(const char *name) {
 
 int rawdev_unmount_all(void) {
     for (size_t i = 0; i < RAWDEV_MAX_DEVICES; i++) {
-        RemoveDevice(g_rawdev_devices[i].root_path);
-        memset(&g_rawdev_devices[i], 0, sizeof(rawdev_device_t));
+        int rc = rawdev_unmount_device(g_rawdev_devices[i].name);
+        if (rc != 0) {
+            return rc;
+        }
     }
 
     return 0;
@@ -184,7 +237,7 @@ static ssize_t rawdev_write(struct _reent *r, void *fd, const char *ptr, size_t 
     size_t sector_size = device->devpart.sector_size;
     uint64_t sector_begin = f->offset / sector_size;
     uint64_t sector_end = (f->offset + len + sector_size - 1) / sector_size;
-    uint64_t sector_end_aligned = sector_end - ((f->offset + len) % sector_size != 0 ? 1 : 0);
+    uint64_t sector_end_aligned;
     uint64_t current_sector = sector_begin;
     const uint8_t *data = (const uint8_t *)ptr;
 
@@ -192,6 +245,13 @@ static ssize_t rawdev_write(struct _reent *r, void *fd, const char *ptr, size_t 
 
     if (sector_end >= device->devpart.num_sectors) {
         len = (size_t)(sector_size * device->devpart.num_sectors - f->offset);
+        sector_end = device->devpart.num_sectors;
+    }
+
+    sector_end_aligned = sector_end - ((f->offset + len) % sector_size != 0 ? 1 : 0);
+
+    if (len == 0) {
+        return 0;
     }
 
     /* Unaligned at the start, we need to read the sector and incorporate the data. */
@@ -258,13 +318,14 @@ static ssize_t rawdev_write(struct _reent *r, void *fd, const char *ptr, size_t 
     f->offset += len;
     return len;
 }
+
 static ssize_t rawdev_read(struct _reent *r, void *fd, char *ptr, size_t len) {
     rawdev_file_t *f = (rawdev_file_t *)fd;
     rawdev_device_t *device = f->device;
     size_t sector_size = device->devpart.sector_size;
     uint64_t sector_begin = f->offset / sector_size;
     uint64_t sector_end = (f->offset + len + sector_size - 1) / sector_size;
-    uint64_t sector_end_aligned = sector_end - ((f->offset + len) % sector_size != 0 ? 1 : 0);
+    uint64_t sector_end_aligned;
     uint64_t current_sector = sector_begin;
     uint8_t *data = (uint8_t *)ptr;
 
@@ -272,6 +333,13 @@ static ssize_t rawdev_read(struct _reent *r, void *fd, char *ptr, size_t len) {
 
     if (sector_end >= device->devpart.num_sectors) {
         len = (size_t)(sector_size * device->devpart.num_sectors - f->offset);
+        sector_end = device->devpart.num_sectors;
+    }
+
+    sector_end_aligned = sector_end - ((f->offset + len) % sector_size != 0 ? 1 : 0);
+
+    if (len == 0) {
+        return 0;
     }
 
     /* Unaligned at the start, we need to read the sector and incorporate the data. */

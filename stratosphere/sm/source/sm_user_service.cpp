@@ -4,7 +4,7 @@
 #include "sm_registration.hpp"
 
 Result UserService::dispatch(IpcParsedCommand &r, IpcCommand &out_c, u64 cmd_id, u8 *pointer_buffer, size_t pointer_buffer_size) {
-    Result rc = 0xF601;   
+    Result rc = 0xF601; 
     switch ((UserServiceCmd)cmd_id) {
         case User_Cmd_Initialize:
             rc = WrapIpcCommandImpl<&UserService::initialize>(this, r, out_c, pointer_buffer, pointer_buffer_size);
@@ -18,6 +18,17 @@ Result UserService::dispatch(IpcParsedCommand &r, IpcCommand &out_c, u64 cmd_id,
         case User_Cmd_UnregisterService:
             rc = WrapIpcCommandImpl<&UserService::unregister_service>(this, r, out_c, pointer_buffer, pointer_buffer_size);
             break;
+#ifdef SM_ENABLE_MITM
+        case User_Cmd_AtmosphereInstallMitm:
+            rc = WrapIpcCommandImpl<&UserService::install_mitm>(this, r, out_c, pointer_buffer, pointer_buffer_size);
+            break;
+        case User_Cmd_AtmosphereUninstallMitm:
+            rc = WrapIpcCommandImpl<&UserService::uninstall_mitm>(this, r, out_c, pointer_buffer, pointer_buffer_size);
+            break;
+        case User_Cmd_AtmosphereAssociatePidTidForMitm:
+            rc = WrapIpcCommandImpl<&UserService::associate_pid_tid_for_mitm>(this, r, out_c, pointer_buffer, pointer_buffer_size);
+            break;
+#endif
         default:
             break;
     }
@@ -56,7 +67,7 @@ std::tuple<Result, MovedHandle> UserService::get_service(u64 service) {
 
 std::tuple<Result, MovedHandle> UserService::deferred_get_service(u64 service) {
     Handle session_h = 0;
-    Result rc = Registration::GetServiceHandle(service, &session_h);
+    Result rc = Registration::GetServiceHandle(this->pid, service, &session_h);
     return {rc, MovedHandle{session_h}};
 }
 
@@ -83,6 +94,36 @@ std::tuple<Result> UserService::unregister_service(u64 service) {
 #endif
     if (this->has_initialized) {
         rc = Registration::UnregisterServiceForPid(this->pid, service);
+    }
+    return {rc};
+}
+
+std::tuple<Result, MovedHandle, MovedHandle> UserService::install_mitm(u64 service) {
+    Handle service_h = 0;
+    Handle query_h = 0;
+    Result rc = 0x415;
+    if (this->has_initialized) {
+        rc = Registration::InstallMitmForPid(this->pid, service, &service_h, &query_h);
+    }
+    return {rc, MovedHandle{service_h}, MovedHandle{query_h}};
+}
+
+std::tuple<Result> UserService::associate_pid_tid_for_mitm(u64 pid, u64 tid) {
+    Result rc = 0x415;
+    if (this->has_initialized) {
+        if (Registration::IsInitialProcess(pid)) {
+            rc = 0x1015;
+        } else {
+            rc = Registration::AssociatePidTidForMitm(pid, tid);
+        }
+    }
+    return {rc};
+}
+
+std::tuple<Result> UserService::uninstall_mitm(u64 service) {
+    Result rc = 0x415;
+    if (this->has_initialized) {
+        rc = Registration::UninstallMitmForPid(this->pid, service);
     }
     return {rc};
 }

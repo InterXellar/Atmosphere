@@ -16,7 +16,7 @@ extern "C" {
 
     u32 __nx_applet_type = AppletType_None;
 
-    #define INNER_HEAP_SIZE 0x200000
+    #define INNER_HEAP_SIZE 0x20000
     size_t nx_inner_heap_size = INNER_HEAP_SIZE;
     char   nx_inner_heap[INNER_HEAP_SIZE];
     
@@ -72,9 +72,11 @@ void __appInit(void) {
     /* Check for exosphere API compatibility. */
     u64 exosphere_cfg;
     if (R_FAILED(splGetConfig((SplConfigItem)65000, &exosphere_cfg))) {
-        fatalSimple(0xCAFE << 4 | 0xFF);
+        //fatalSimple(0xCAFE << 4 | 0xFF);
         /* TODO: Does Loader need to know about target firmware/master key revision? If so, extract from exosphere_cfg. */
     }
+    
+    //splExit();
 }
 
 void __appExit(void) {
@@ -91,7 +93,7 @@ int main(int argc, char **argv)
     consoleDebugInit(debugDevice_SVC);
         
     /* TODO: What's a good timeout value to use here? */
-    WaitableManager *server_manager = new WaitableManager(U64_MAX);
+    auto server_manager = std::make_unique<WaitableManager>(U64_MAX);
     
     /* Add services to manager. */
     server_manager->add_waitable(new ServiceServer<ProcessManagerService>("ldr:pm", 1));
@@ -105,8 +107,6 @@ int main(int argc, char **argv)
     /* Loop forever, servicing our services. */
     server_manager->process();
     
-    /* Cleanup. */
-    delete server_manager;
 	return 0;
 }
 

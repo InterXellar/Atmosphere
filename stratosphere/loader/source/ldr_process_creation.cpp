@@ -93,6 +93,7 @@ Result ProcessCreation::CreateProcess(Handle *out_process_h, u64 index, char *nc
     Registration::Process *target_process;
     Handle process_h = 0;
     u64 process_id = 0;
+    bool mounted_code = false;
     Result rc;
     
     /* Get the process from the registration queue. */
@@ -102,9 +103,16 @@ Result ProcessCreation::CreateProcess(Handle *out_process_h, u64 index, char *nc
     }
     
     /* Mount the title's exefs. */
-    rc = ContentManagement::MountCodeForTidSid(&target_process->tid_sid);  
-    if (R_FAILED(rc)) {
-        return rc;
+    if (target_process->tid_sid.storage_id != FsStorageId_None) {
+        rc = ContentManagement::MountCodeForTidSid(&target_process->tid_sid);  
+        if (R_FAILED(rc)) {
+            return rc;
+        }
+        mounted_code = true;
+    } else {
+        if (R_SUCCEEDED(ContentManagement::MountCodeNspOnSd(target_process->tid_sid.title_id))) {
+            mounted_code = true;
+        }
     }
     
     /* Load the process's NPDM. */
@@ -142,7 +150,7 @@ Result ProcessCreation::CreateProcess(Handle *out_process_h, u64 index, char *nc
     if (R_FAILED(rc)) {
         goto CREATE_PROCESS_END;
     }
-    
+        
     /* Figure out where NSOs will be mapped, and how much space they (and arguments) will take up. */
     rc = NsoUtils::CalculateNsoLoadExtents(process_info.process_flags, launch_item != NULL ? launch_item->arg_size : 0, &nso_extents);
     if (R_FAILED(rc)) {
@@ -186,12 +194,17 @@ Result ProcessCreation::CreateProcess(Handle *out_process_h, u64 index, char *nc
         }
     }
     
+    /* Send the pid/tid pair to anyone interested in man-in-the-middle-attacking it. */
+    Registration::AssociatePidTidForMitM(index);
+    
     rc = 0;  
 CREATE_PROCESS_END:
-    if (R_SUCCEEDED(rc)) {
-        rc = ContentManagement::UnmountCode();
-    } else {
-        ContentManagement::UnmountCode();
+    if (mounted_code) {
+        if (R_SUCCEEDED(rc) && target_process->tid_sid.storage_id != FsStorageId_None) {
+            rc = ContentManagement::UnmountCode();
+        } else {
+            ContentManagement::UnmountCode();
+        }
     }
     if (R_SUCCEEDED(rc)) {
         *out_process_h = process_h;

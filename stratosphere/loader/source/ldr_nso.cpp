@@ -7,6 +7,7 @@
 #include "ldr_nso.hpp"
 #include "ldr_map.hpp"
 #include "ldr_random.hpp"
+#include "ldr_patcher.hpp"
 
 static NsoUtils::NsoHeader g_nso_headers[NSO_NUM_MAX] = {0};
 static bool g_nso_present[NSO_NUM_MAX] = {0};
@@ -141,6 +142,7 @@ Result NsoUtils::CalculateNsoLoadExtents(u32 addspace_type, u32 args_size, NsoLo
                 /* What the fuck? Where does 0x9007 come from? */
                 extents->args_size = (2 * args_size + 0x9007);
                 extents->args_size &= ~0xFFFULL;
+                extents->total_size += extents->args_size;
             }
         }
     }
@@ -198,7 +200,8 @@ Result NsoUtils::CalculateNsoLoadExtents(u32 addspace_type, u32 args_size, NsoLo
 }
 
 
-Result NsoUtils::LoadNsoSegment(unsigned int index, unsigned int segment, FILE *f_nso, u8 *map_base, u8 *map_end) {
+
+Result NsoUtils::LoadNsoSegment(u64 title_id, unsigned int index, unsigned int segment, FILE *f_nso, u8 *map_base, u8 *map_end) {
     bool is_compressed = ((g_nso_headers[index].flags >> segment) & 1) != 0;
     bool check_hash = ((g_nso_headers[index].flags >> (segment + 3)) & 1) != 0;
     size_t out_size = g_nso_headers[index].segments[segment].decomp_size;
@@ -229,10 +232,11 @@ Result NsoUtils::LoadNsoSegment(unsigned int index, unsigned int segment, FILE *
     
     if (check_hash) {
         u8 hash[0x20] = {0};
-        SHA256_CTX sha_ctx;
+        struct sha256_state sha_ctx;
         sha256_init(&sha_ctx);
         sha256_update(&sha_ctx, dst_addr, out_size);
-        sha256_final(&sha_ctx, hash);
+        sha256_finalize(&sha_ctx);
+        sha256_finish(&sha_ctx, hash);
 
         if (std::memcmp(g_nso_headers[index].section_hashes[segment], hash, sizeof(hash))) {
             return 0xA09;
@@ -259,7 +263,7 @@ Result NsoUtils::LoadNsosIntoProcessMemory(Handle process_h, u64 title_id, NsoLo
                 return 0xA09;
             }
             for (unsigned int seg = 0; seg < 3; seg++) {
-                if (R_FAILED((rc = LoadNsoSegment(i, seg, f_nso, map_base, map_base + extents->nso_sizes[i])))) {
+                if (R_FAILED((rc = LoadNsoSegment(title_id, i, seg, f_nso, map_base, map_base + extents->nso_sizes[i])))) {
                     fclose(f_nso);
                     return rc;
                 }
@@ -279,6 +283,9 @@ Result NsoUtils::LoadNsosIntoProcessMemory(Handle process_h, u64 title_id, NsoLo
             /* Zero out .bss. */
             u64 bss_base = rw_start + g_nso_headers[i].segments[2].decomp_size, bss_size = g_nso_headers[i].segments[2].align_or_total_size;
             std::fill(map_base + bss_base, map_base + bss_base + bss_size, 0);
+            
+            /* Apply patches to loaded module. */
+            PatchUtils::ApplyPatches(&g_nso_headers[i], map_base, bss_base);
             
             nso_map.Close();
             

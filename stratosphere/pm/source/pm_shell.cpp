@@ -1,7 +1,9 @@
 #include <switch.h>
+#include <stratosphere.hpp>
 #include "pm_registration.hpp"
 #include "pm_resource_limits.hpp"
 #include "pm_shell.hpp"
+#include "pm_boot2.hpp"
 
 static bool g_has_boot_finished = false;
 
@@ -89,9 +91,9 @@ std::tuple<Result, u64> ShellService::launch_process(u64 launch_flags, Registrat
 }
 
 std::tuple<Result> ShellService::terminate_process_id(u64 pid) {
-    Registration::AutoProcessListLock auto_lock;
+    auto auto_lock = Registration::GetProcessListUniqueLock();
     
-    Registration::Process *proc = Registration::GetProcess(pid);
+    std::shared_ptr<Registration::Process> proc = Registration::GetProcess(pid);
     if (proc != NULL) {
         return {svcTerminateProcess(proc->handle)};
     } else {
@@ -100,9 +102,9 @@ std::tuple<Result> ShellService::terminate_process_id(u64 pid) {
 }
 
 std::tuple<Result> ShellService::terminate_title_id(u64 tid) {
-    Registration::AutoProcessListLock auto_lock;
+    auto auto_lock = Registration::GetProcessListUniqueLock();
     
-    Registration::Process *proc = Registration::GetProcessByTitleId(tid);
+    std::shared_ptr<Registration::Process> proc = Registration::GetProcessByTitleId(tid);
     if (proc != NULL) {
         return {svcTerminateProcess(proc->handle)};
     } else {
@@ -121,9 +123,9 @@ std::tuple<Result, u64, u64> ShellService::get_process_event_type() {
 }
 
 std::tuple<Result> ShellService::finalize_exited_process(u64 pid) {
-    Registration::AutoProcessListLock auto_lock;
+    auto auto_lock = Registration::GetProcessListUniqueLock();
     
-    Registration::Process *proc = Registration::GetProcess(pid);
+    std::shared_ptr<Registration::Process> proc = Registration::GetProcess(pid);
     if (proc == NULL) {
         return {0x20F};
     } else if (proc->state != ProcessState_Exited) {
@@ -135,11 +137,11 @@ std::tuple<Result> ShellService::finalize_exited_process(u64 pid) {
 }
 
 std::tuple<Result> ShellService::clear_process_notification_flag(u64 pid) {
-    Registration::AutoProcessListLock auto_lock;
+    auto auto_lock = Registration::GetProcessListUniqueLock();
     
-    Registration::Process *proc = Registration::GetProcess(pid);
+    std::shared_ptr<Registration::Process> proc = Registration::GetProcess(pid);
     if (proc != NULL) {
-        proc->flags &= ~2;
+        proc->flags &= ~PROCESSFLAGS_CRASHED;
         return {0x0};
     } else {
         return {0x20F};
@@ -147,18 +149,17 @@ std::tuple<Result> ShellService::clear_process_notification_flag(u64 pid) {
 }
 
 std::tuple<Result> ShellService::notify_boot_finished() {
-    u64 boot2_pid;
     if (!g_has_boot_finished) {
         g_has_boot_finished = true;
-        return {Registration::LaunchProcess(BOOT2_TITLE_ID, FsStorageId_NandSystem, 0, &boot2_pid)};
+        EmbeddedBoot2::Main();
     }
     return {0};
 }
 
 std::tuple<Result, u64> ShellService::get_application_process_id() {
-    Registration::AutoProcessListLock auto_lock;
+    auto auto_lock = Registration::GetProcessListUniqueLock();
     
-    Registration::Process *app_proc;
+    std::shared_ptr<Registration::Process> app_proc;
     if (Registration::HasApplicationProcess(&app_proc)) {
         return {0, app_proc->pid};
     }
